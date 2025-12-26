@@ -1,0 +1,9 @@
+LINUX:
+
+rm -rf build && mkdir build && cd build
+
+cmake .. -DNUKE_VERSION=16.0v6 -DCMAKE_INSTALL_PREFIX=~/.nuke
+
+make 
+
+////
