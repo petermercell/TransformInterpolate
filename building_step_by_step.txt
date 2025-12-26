@@ -20,3 +20,13 @@ cmake .. -G "Visual Studio 17 2022" -A x64 -DNUKE_VERSION=16.0v6 -DCMAKE_INSTALL
 cmake --build . --config Release --verbose
 
 ////
+
+MAC:
+
+cd /Users/g/Downloads/TransformInterpolate-main/TI160M 
+
+rm -rf build && mkdir build && cd build
+
+cmake .. -DNUKE_VERSION=16.0v6 -DCMAKE_INSTALL_PREFIX=~/.nuke
+
+make 
