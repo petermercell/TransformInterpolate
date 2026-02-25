@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <iostream>
+#include <sstream>
+#include <vector>
 #include <math.h>
 
 using namespace DD::Image;
@@ -54,7 +56,15 @@ class TransformInterpolate : public Transform
     bool _cornerpin_components;
     bool _use_shear;
 
+    int _bakeStart;
+    int _bakeEnd;
+
     float widthA, widthB, heightA, heightB;
+
+    // Full interpolated forward matrix (mA+mB dissolved) — what maps original
+    // source corners to their final on-screen positions.  Cached by setMatrix()
+    // and exposed row-major via MultiFloat_knob so Python can read it directly.
+    Matrix4 _interpolatedMatrix;
 
     Matrix4 createCornerPinMatrix(xyStruct from[4], xyStruct to[4]);
     Matrix4 dissolveMatricesWithCompensation(Matrix4 mA, Matrix4 mB, float factor);
@@ -71,6 +81,11 @@ class TransformInterpolate : public Transform
         _dissolve = 0.5;
         widthA = widthB = heightA = heightB = 0.0;
         _compensationFactor = 0.0f;
+        _bakeStart = 1001;
+        _bakeEnd = 1100;
+
+        // Initialise interpolated matrix to identity
+        _interpolatedMatrix.makeIdentity();
 
         const Format& format = input_format();
     }
@@ -79,8 +94,10 @@ class TransformInterpolate : public Transform
     int maximum_inputs() const { return MAX_INPUTS; }
     int minimum_inputs() const { return 2; }
     void knobs(Knob_Callback f) override;
+    int knob_changed(Knob* k) override;
     void _validate(bool for_real) override;
     void draw_handle(ViewerContext* ctx) override;
+    void bake_to_cornerpin();
 
     static const Description desc;
     const char* Class() const override { return CLASS; }
@@ -430,6 +447,9 @@ void TransformInterpolate::setMatrix(Matrix4& matrix)
     if (_cornerpin_components)
         interpolatedMatrix = dissolveMatricesByComponent(mA, mB, _dissolve);
 
+    // Cache the full forward transform for the display knob / export.
+    _interpolatedMatrix = interpolatedMatrix;
+
     // Final result is a product of our new matrix and original B matrix inverted (to undo its effect).
     matrix = interpolatedMatrix * matrix;
 }
@@ -479,6 +499,195 @@ void TransformInterpolate::knobs(Knob_Callback f)
     Float_knob(f, &_compensationFactor, "CP compensation");
     SetFlags(f, DD::Image::Knob::ALWAYS_SAVE | DD::Image::Knob::STARTLINE);
     Transform::knobs(f);
+
+    Divider(f, "");
+    Int_knob(f, &_bakeStart, "bake_start", "bake start");
+    SetFlags(f, DD::Image::Knob::STARTLINE);
+    Int_knob(f, &_bakeEnd, "bake_end", "bake end");
+    Button(f, "set_range_from_project", "Set Range from Project");
+    Button(f, "bake_to_cornerpin", "Bake to CornerPin");
+    SetFlags(f, DD::Image::Knob::STARTLINE);
+}
+
+
+int TransformInterpolate::knob_changed(Knob* k)
+{
+    if (k->is("bake_to_cornerpin"))
+    {
+        if (_bakeStart > _bakeEnd)
+        {
+            script_command("nuke.message('Bake Start must be less than or equal to Bake End.')", true, false);
+            script_unlock();
+            return 1;
+        }
+        bake_to_cornerpin();
+        return 1;
+    }
+    if (k->is("set_range_from_project"))
+    {
+        script_command("nuke.root().firstFrame()", true, true);
+        int first = atoi(script_result(true));
+        script_unlock();
+
+        script_command("nuke.root().lastFrame()", true, true);
+        int last = atoi(script_result(true));
+        script_unlock();
+
+        knob("bake_start")->set_value(first);
+        knob("bake_end")->set_value(last);
+        return 1;
+    }
+    return Transform::knob_changed(k);
+}
+
+
+void TransformInterpolate::bake_to_cornerpin()
+{
+    if (!input(0) || !input(1)) return;
+
+    int frameStart = _bakeStart;
+    int frameEnd   = _bakeEnd;
+
+    // Create a ProgressTask for user feedback + cancel button
+    script_command(
+        "_ti_progress = nuke.ProgressTask('Baking to CornerPin')\n"
+        "_ti_progress.setMessage('Sampling frames...')\n",
+        true, false);
+    script_unlock();
+
+    // Collect corner positions for each frame
+    // Order: BL(0,0), BR(w,0), TR(w,h), TL(0,h) — Nuke CornerPin convention
+    enum CPKEY
+    {
+        X0, Y0,   // to1
+        X1, Y1,   // to2
+        X2, Y2,   // to3
+        X3, Y3,   // to4
+        CPKEY_SIZE
+    };
+
+    int frameRange = frameEnd - frameStart + 1;
+    std::vector<std::vector<float>> keys(CPKEY_SIZE);
+    for (int k = 0; k < CPKEY_SIZE; ++k)
+        keys[k].reserve(frameRange);
+
+    bool cancelled = false;
+
+    // Sample the interpolated matrix at every frame.
+    // Uses node_input() instead of gotoContext() so the Viewer doesn't
+    // re-render on every frame — same approach as TransformCopy.
+    OutputContext context = outputContext();
+    for (int f = frameStart; f <= frameEnd; ++f)
+    {
+        // --- Update progress & check for cancellation ---
+        {
+            int pct = (int)((float)(f - frameStart) / (float)frameRange * 100.0f);
+            std::ostringstream prog;
+            prog << "_ti_progress.setProgress(" << pct << ")\n"
+                 << "_ti_progress.setMessage('Frame " << f
+                 << " of " << frameEnd << "')\n";
+            script_command(prog.str().c_str(), true, false);
+            script_unlock();
+
+            script_command("_ti_progress.isCancelled()", true, true);
+            const char* res = script_result(true);
+            bool is_cancelled = (res && strcmp(res, "True") == 0);
+            script_unlock();
+
+            if (is_cancelled)
+            {
+                cancelled = true;
+                break;
+            }
+        }
+
+        context.setFrame((double)f);
+
+        // Read dissolve factor at this frame
+        Hash hash;
+        knob("Factor")->store(FloatPtr, &_dissolve, hash, context);
+
+        // Retrieve input transforms at this frame via node_input() —
+        // this does NOT trigger viewer updates (unlike gotoContext).
+        Transform* trf0 = dynamic_cast<Transform*>(node_input(0, Op::EXECUTABLE_SKIP, &context));
+        if (trf0)
+        {
+            trf0->validate();
+            mB = trf0->concat_matrix();
+        }
+
+        Transform* trf1 = dynamic_cast<Transform*>(node_input(1, Op::EXECUTABLE_SKIP, &context));
+        if (trf1)
+        {
+            trf1->validate();
+            mA = trf1->concat_matrix();
+        }
+
+        // Build the interpolated matrix (caches result in _interpolatedMatrix)
+        Matrix4 mat;
+        setMatrix(mat);
+
+        // Use the cached forward matrix to transform format corners
+        float w = widthB;
+        float h = heightB;
+
+        Vector4 v0 = _interpolatedMatrix.transform({0, 0, 1, 1}).divide_w();
+        Vector4 v1 = _interpolatedMatrix.transform({w, 0, 1, 1}).divide_w();
+        Vector4 v2 = _interpolatedMatrix.transform({w, h, 1, 1}).divide_w();
+        Vector4 v3 = _interpolatedMatrix.transform({0, h, 1, 1}).divide_w();
+
+        keys[X0].push_back(v0.x); keys[Y0].push_back(v0.y);
+        keys[X1].push_back(v1.x); keys[Y1].push_back(v1.y);
+        keys[X2].push_back(v2.x); keys[Y2].push_back(v2.y);
+        keys[X3].push_back(v3.x); keys[Y3].push_back(v3.y);
+    }
+
+    // Clean up progress bar
+    script_command("del _ti_progress\n", true, false);
+    script_unlock();
+
+    // If user cancelled, bail without creating the node
+    if (cancelled) return;
+
+    // Build TCL script using Nuke {curve R xN ...} syntax
+    // The knob value interleaving matches CornerPin2D's to1..to4 knobs
+    const char* const knobTokens[CPKEY_SIZE + 1] =
+    {
+        // to1 {X0 Y0} to2 {X1 Y1} to3 {X2 Y2} to4 {X3 Y3}
+        "'to1 {",
+        " ",
+        " } to2 {",
+        " ",
+        " } to3 {",
+        " ",
+        " } to4 {",
+        " ",
+        " } ",
+    };
+
+    int w = (int)widthB;
+    int h = (int)heightB;
+
+    std::stringstream script;
+    script << "nukescripts.clear_selection_recursive();"
+           << "nuke.autoplace(nuke.createNode('CornerPin2D',";
+
+    for (int k = 0; k < CPKEY_SIZE; ++k)
+    {
+        script << knobTokens[k];
+        script << "{curve R x" << frameStart << " ";
+        for (int f = 0; f < frameRange; ++f)
+            script << keys[k][f] << " ";
+        script << "}";
+    }
+
+    script << knobTokens[CPKEY_SIZE];
+    script << " label {TransformInterpolate \\nframes " << frameStart << " - " << frameEnd << "}";
+    script << " from1 {0 0} from2 {" << w << " 0} from3 {" << w << " " << h << "} from4 {0 " << h << "}";
+    script << "'));";
+
+    script_command(script.str().c_str(), true, false);
+    script_unlock();
 }
 
 
@@ -515,6 +724,7 @@ void TransformInterpolate::_validate(bool for_real)
     }
 
     setMatrix(*matrix());
+
     Transform::_validate(for_real);
 }
 
